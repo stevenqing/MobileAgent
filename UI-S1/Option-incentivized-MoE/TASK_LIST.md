@@ -33,13 +33,33 @@
                     └── 任务12: MoE 完整集成 ← 同时依赖 [8, 10]
                         └── 任务13: 多智能体扩展 (MA-GUI)
 
+任务14: MoE SFT v1 基线训练 ✅ 完成（Router Collapse）
+    前置依赖: 无（直接复用 verl/models/moe/ 已有模块）
+    后续: 任务15（修复 router collapse + 评估）
+          任务8（连通性感知路由损失可在 MoE SFT 基线上叠加）
+          任务12（MoE 完整集成需要 SFT 基线对比）
+    训练结果: Job 2610726, loss 19.25→2.34 ✅, 但 router collapse ❌
+              expert_1 权重=0.9999，routing_entropy=0.0002
+              原因: balance_weight=0.0，router 无约束
+
+任务15: MoE v2 修复 Router Collapse + 评估 🔄 执行中
+    前置依赖: 任务14（v1 checkpoint）
+    子任务A: Copy-Init ✅ 完成（6 expert 一致，routing entropy=0.994）
+    子任务B: v2 重训练 🔄 Job 2624595 运行中（4 nodes × 4 GPUs）
+    子任务C: 评估 🔄 Job 2624593 (MoE v1) + Job 2624594 (SFT-398) 运行中
+    后续: 任务8（连通性感知路由损失可在 v2 基线上叠加）
+
 注：Tool-Use 快捷操作（层1，时间抽象）与 MoE Expert（层2，功能特化）正交组合，
     不互相替代。见任务5"架构分析"小节。
+    任务14 是标准 MoE SFT 基线，为后续 Option-Incentivized 改进提供对照。
+    关键修复：Hook→模块替换(MoELoRALinear)，解决梯度为零问题。
+    任务15 修复 v1 的 router collapse 问题，增加 balance loss + z-loss。
 ```
 
 **MVP 关键路径：** 1 → 2 → 3 → 4 → 5 → 7 → 10
 **VLM 特征函数路径：** 3 → 3.1（独立于 MVP 路径，用于对比验证）
 **MoE 集成路径：** 3 → 8 → 9 → 12
+**MoE SFT 基线路径：** 14 ✅ v1完成(collapse) → 15 🔄 执行中 A✅/B训练中/C评估中
 
 ---
 
@@ -1884,6 +1904,340 @@ Agent B（导航专家）：    → macro_cross_app_switch, macro_deep_settings
 
 ---
 
+## 第六阶段：MoE SFT 基线
+
+### 任务14：MoE SFT 基线训练（Qwen2.5-VL-7B + 6×ExpertLoRA）
+- **状态：** `训练中` 🔄（Job 2610726, loss 持续下降, grad_norm 正常）
+- **前置依赖：** 无（直接复用 `verl/models/moe/` 已有模块）
+- **阻塞：** 任务8（连通性感知路由可在此基线上叠加）、任务12（需要基线对比）
+- **优先级：** 高 — 为后续 Option-Incentivized MoE 改进提供标准对照
+
+**目标：** 在 GUI-360 全量数据上训练标准 MoE SFT 基线。所有 6 个 expert 参与每个 sample（top_k=6），router 学习加权组合。不使用 balance loss 或 z-loss（因为所有 expert 始终激活）。训练完成后作为任务8/12 的对照基线。
+
+**架构（模块替换方式）：**
+```
+Qwen2.5-VL-7B-Instruct (frozen)
+  ├── target nn.Linear 被替换为 MoELoRALinear:
+  │     base_linear (frozen) + 6×LoRALayer (trainable)
+  │     forward: base_out + weighted_sum(expert_deltas)
+  ├── TextOnlyRouter (trainable): hidden_states → routing_weights
+  └── 两次 forward pass:
+        Pass 1 (no_grad, LoRA 禁用): 提取 hidden_states → router → routing_weights
+        Pass 2 (with grad, LoRA 启用): 设置 routing_weights → forward → loss
+
+top_k=6: 所有 expert 参与每个 sample，router 学习加权组合
+Loss = LM_loss only（无 balance loss / z-loss）
+Trainable: ~31M（Router ~1M + 6 Expert LoRA ~30M）
+  注：v_proj 使用 GQA (out=512 而非 3584)，实际参数量比原估计的 38M 少
+```
+
+**训练配置：**
+| 参数 | 值 |
+|------|-----|
+| Base Model | `checkpoints/Qwen2.5-VL-7B-Instruct`（frozen） |
+| Experts | 6 × ExpertLoRA, r=16, alpha=32, target=[q_proj, v_proj] |
+| top_k | 6（全部 expert 始终参与） |
+| Router | TextOnlyRouter, hidden=256, mean pooling |
+| use_vectorized_routing | true |
+| balance_weight | 0.0（top_k=6 不需要 balance） |
+| z_loss_weight | 0.0 |
+| Learning Rate | 5e-5, cosine schedule, warmup=5% |
+| Batch Size | 1 per GPU × 16 grad_accum × 16 GPUs = 256 effective |
+| Epochs | 3 |
+| gradient_checkpointing | **false**（见审计 Bug #2） |
+| DeepSpeed | ZeRO-2, bf16, grad_clip=0.5 |
+| 数据 | GUI-360 train (101K samples, ShareGPT format) |
+| 硬件 | 4 nodes × 4 GPUs, 24h |
+
+**复用的已有模块：**
+| 组件 | 来源 |
+|------|------|
+| MoE 模块 | `verl/models/moe/`（router, expert_lora, moe_wrapper, moe_loss） |
+| 训练数据 | `train_GUI_360/llamafactory/data/gui360_train.json`（101K, ShareGPT） |
+| SLURM 模板 | `train_GUI_360/llamafactory/train_gui360_llamafactory.slurm` |
+
+**实现细节：**
+
+1. **数据加载**（`GUI360MoESFTDataset`）：
+   - 读取 ShareGPT 格式 JSON（`conversations` + `images`）
+   - 将 `<image>` 占位符替换为 Qwen2.5-VL 的 `{"type": "image", ...}` 格式
+   - 使用 `AutoProcessor.apply_chat_template()` 生成模型输入
+   - 自动构建 labels：mask 掉 user/system tokens，仅在 assistant response 上计算 loss
+
+2. **MoE 包装**（`MoEVLMWrapper` — 模块替换方式）：
+   - Qwen2.5-VL-7B base model 全参数冻结
+   - **模块替换**：target `nn.Linear`（q_proj, v_proj）被替换为 `MoELoRALinear`：
+     - 包含 frozen `base_linear` + 6 个 trainable `LoRALayer`
+     - `forward()`: `base_out + weighted_sum(expert_deltas)`
+     - 路由权重通过 `set_routing_weights()` 外部设置
+   - TextOnlyRouter 从 hidden_states mean pooling 提取 instruction features → 路由权重
+   - 两次 forward pass：Pass 1 无 LoRA 取 routing features；Pass 2 有 LoRA 计算 loss
+   - **自动检测 module dims**：从 base model 检测 q_proj=(3584,3584), v_proj=(3584,512)
+   - DDP 自然兼容：LoRA params 是 module tree 的正式子节点，无需手动 allreduce
+
+3. **自定义 Trainer**（`MoESFTTrainer`）：
+   - `compute_loss()`: 调用 MoEVLMWrapper.forward()，返回 LM loss
+   - 每 logging_steps 步记录 per-expert routing weight 均值 + routing entropy + max/min weight
+   - `_save()`: 只保存 router + 6 expert LoRA（不保存 frozen base model）
+   - 无需 DDP unwrapping 或 manual gradient allreduce（模块替换方式下 DDP 自然工作）
+
+4. **Checkpoint 保存格式**：
+   ```
+   output_dir/
+   ├── router.pt              # Router state_dict
+   ├── experts/
+   │   ├── expert_0/          # PEFT format
+   │   │   ├── adapter_model.bin
+   │   │   └── adapter_config.json
+   │   ├── expert_1/
+   │   └── ...
+   ├── moe_config.json
+   └── training_args.bin
+   ```
+
+#### 代码审计与迭代记录
+
+##### 审计 v1（2026-03-04 上午）：维度检测 + checkpointing 冲突
+
+对实现进行端到端梯度流审计，发现并修复 2 个 Critical bug，验证 1 个预期行为。
+
+**Bug #1 [CRITICAL — 已修复]: v_proj LoRA 维度不匹配**
+
+Qwen2.5-VL-7B 使用 GQA（Grouped Query Attention），KV head 数量 = 4：
+```
+q_proj: Linear(in=3584, out=3584)   # 28 heads
+v_proj: Linear(in=3584, out=512)    # 4 KV heads ← 不是 3584!
+```
+
+`ExpertLoRACollection` 默认所有 module 使用 `(hidden_size, hidden_size)` = `(3584, 3584)` 作为 LoRA 维度。
+对 v_proj，LoRA delta 输出 shape=[B, seq, 3584]，但 v_proj 实际输出 shape=[B, seq, 512]。
+`base_output + delta` → **shape mismatch 运行时崩溃**。
+
+**修复：** `_auto_detect_module_dims()` 遍历 base model 检测真实维度。
+
+**Bug #2 [CRITICAL — 已修复]: gradient_checkpointing 与 hook routing state 冲突**
+
+硬编码 `gradient_checkpointing=False`，batch=1 + frozen 7B base 内存足够。
+
+##### 审计 v2（2026-03-04 下午）：Hook → 模块替换重构 [核心修复]
+
+**Bug #3 [CRITICAL — 已修复]: Forward hook 方式 LoRA 注入导致梯度为零**
+
+初始实现使用 `register_forward_hook()` 在 q_proj/v_proj 的 output 上注入 LoRA delta。
+训练中发现 `grad_norm: 0.0` 持续不变，loss 不下降。
+
+**排查过程（6 个 SLURM jobs）：**
+1. Job 2605580: loss 平坦，grad_norm=0。初步怀疑 DDP。
+2. Job 2607200/2607953: 添加 grad 诊断，发现 `router_params_with_grad: 4`（但值为 0），`lora_params_with_grad: 0`（grad=None）
+3. Job 2608679: 绕过 DDP，使用手动 allreduce。DDP 错误确认 LoRA params "did not receive grad"
+4. Job 2608824: 完全移除 DDP（unwrap after accelerate.prepare），仍然 `lora_params_with_grad: 0`
+   → **证明问题不在 DDP，在 hook 本身**
+5. Job 2609061: 在 hook 内部添加 debug，发现 `delta.requires_grad=True` 但梯度不回传到 LoRA params
+
+**根因分析：** Forward hook 方式在训练中根本不可靠：
+- Hook 修改 output 但不在 module 的 `forward()` 计算图中
+- Autograd 不追踪 hook 内部的参数使用
+- 所有成熟的 MoE-LoRA 实现（LoRAMoE, MoE-LoRA, MixLoRA, MOELoRA-peft）都使用**模块替换**而非 hook
+
+**修复方案：模块替换（Module Replacement）**
+
+新增 `MoELoRALinear(nn.Module)` 类，替换 target `nn.Linear`：
+```python
+class MoELoRALinear(nn.Module):
+    def __init__(self, base_linear, num_experts, r, alpha, dropout):
+        self.base_linear = base_linear    # frozen
+        self.expert_loras = nn.ModuleList([LoRALayer(...) for _ in range(num_experts)])
+        self._routing_weights = None      # set externally
+
+    def forward(self, x):
+        base_out = self.base_linear(x)
+        if self._routing_weights is None:
+            return base_out               # Pass 1: no LoRA
+        all_deltas = torch.stack([lora(x) for lora in self.expert_loras], dim=0)
+        weighted_delta = (all_deltas.permute(1,0,2,3) * weights[...,None,None]).sum(dim=1)
+        return base_out + weighted_delta   # Pass 2: with LoRA
+```
+
+`MoEVLMWrapper._replace_target_modules()` 用 `setattr()` 将 base model 中的 target `nn.Linear` 替换为 `MoELoRALinear`。
+
+**关键优势：**
+- LoRA 参数是 module tree 的正式子节点 → autograd 正确追踪 → 梯度自然回传
+- DDP 自然工作（无需 unwrapping 或手动 allreduce）
+- 可兼容 gradient_checkpointing（无 routing state 清除问题）
+- 训练脚本大幅简化（移除所有 DDP hack）
+
+**训练验证（Job 2610726）：**
+```
+Step 10: loss=19.25  grad_norm=8.71   (previously: grad_norm=0.0!)
+Step 20: loss=18.77  grad_norm=13.87
+Step 30: loss=15.10  grad_norm=15.49
+Step 40: loss=10.86  grad_norm=12.70
+Step 50: loss=7.29   grad_norm=6.57
+```
+Loss 持续下降，grad_norm 正常。Router 开始分化（expert_1 权重从 0.17 升至 0.39）。
+
+**预期行为: Router 在 step 0 梯度为零（正常的 LoRA 启动现象）**
+
+LoRA 标准初始化：`lora_B = 0` → 初始 delta 全零。
+`lora_B` 从 step 0 即获得梯度（`d(loss)/d(B) ∝ lora_A @ x`），`lora_A` 在 step 1 后获得梯度（`B` 更新后不再为零）。
+Router 权重在 step 1 后开始分化。
+
+**修改文件汇总：**
+| 文件 | 修改内容 | 对应 Bug |
+|------|---------|---------|
+| `verl/models/moe/expert_lora.py` | 新增 `MoELoRALinear` 类（模块替换核心） | #3 |
+| `verl/models/moe/moe_wrapper.py` | 重写为模块替换方式：`_replace_target_modules()`、`_set/_clear_routing_weights()`；移除 hook/ExpertApplier 相关代码 | #1, #2, #3 |
+| `verl/models/moe/__init__.py` | 导出 `MoELoRALinear` | #3 |
+| `train_GUI_360/moe_sft/train_moe_sft.py` | 简化 Trainer（移除 DDP unwrapping/manual allreduce）；`ddp_find_unused_parameters=False` | #3 |
+| `train_GUI_360/moe_sft/moe_sft_config.yaml` | `gradient_checkpointing: false` | #2 |
+
+**已创建/修改文件：**
+| 文件 | 说明 |
+|------|------|
+| `verl/models/moe/expert_lora.py`（已修改） | 新增 `MoELoRALinear` 模块替换类 |
+| `verl/models/moe/moe_wrapper.py`（已重写） | 模块替换方式：`_replace_target_modules()` + routing weight 管理 |
+| `verl/models/moe/__init__.py`（已更新） | 导出 `MoELoRALinear` |
+| `train_GUI_360/moe_sft/moe_sft_config.yaml` | 训练配置（模型/MoE/数据/训练超参） |
+| `train_GUI_360/moe_sft/train_moe_sft.py`（已简化） | 主训练脚本（Dataset + Collator + 简化 Trainer） |
+| `train_GUI_360/moe_sft/ds_z2_config.json` | DeepSpeed ZeRO-2 配置（当前未使用，env 无 deepspeed） |
+| `train_GUI_360/moe_sft/train_moe_sft.slurm` | SLURM 提交脚本（4 nodes × 4 GPUs, 24h） |
+
+**训练状态（Job 2610726）：**
+- Wandb: https://wandb.ai/k23048755/huggingface/runs/cdcw2fc6
+- 硬件：4 nodes × 4 GPUs (GH200 96GB)，GPU 内存使用 74-99%
+- 速度：~9.4s/step，1194 total steps，预计 ~3.1h
+- DeepSpeed 不可用（env 未安装），fallback 到 DDP
+- `ddp_find_unused_parameters=False`（DDP 确认无 unused params）
+
+**训练曲线（前 50 步）：**
+```
+Step 10: loss=19.25  grad_norm=8.71   lr=7.5e-6   routing_entropy=1.785
+Step 20: loss=18.77  grad_norm=13.87  lr=1.58e-5  routing_entropy=1.649
+Step 30: loss=15.10  grad_norm=15.49  lr=2.42e-5
+Step 40: loss=10.86  grad_norm=12.70  lr=3.25e-5
+Step 50: loss=7.29   grad_norm=6.57   lr=4.08e-5
+```
+
+**验证指标：**
+- ✅ LM loss 持续下降（19.25 → 7.29）
+- ✅ grad_norm 非零（8.7 ~ 15.5），之前 hook 方式为 0.0
+- ✅ Router 开始分化：expert_1 权重从 0.17 → 0.39
+- ✅ Routing entropy 下降：1.785 → 1.649（router 学到了 specialization）
+- Wandb 监控 `routing/expert_{i}_weight` 分布
+- Wandb 监控 `routing/max_weight` 和 `routing/min_weight`
+
+**提交训练：**
+```bash
+cd /scratch/a5l/shuqing.a5l/MobileAgent/UI-S1
+sbatch train_GUI_360/moe_sft/train_moe_sft.slurm
+```
+
+**与 Option-Incentivized 方法的关系：**
+- 任务14 是**标准 MoE SFT 基线**，不含任何 option/eigenfunction/connectivity 信号
+- 任务8（连通性感知路由损失）可在此基线上叠加 $-\lambda_2$ 损失项
+- 任务12（MoE 完整集成）需要此基线作为 ablation 对照
+- 对比实验设计：任务14 (baseline) vs 任务14+8 (connectivity) vs 任务14+8+9 (progressive)
+
+**MoE SFT v1 最终结果（Job 2610726 完成）：**
+- Loss: 19.25 → 2.34 ✅（正常下降）
+- Router Collapse ❌：expert_1 权重 = 0.9999，其余 ~1e-6，routing_entropy = 0.0002
+- 根因：`balance_weight=0.0`，router 无约束导致坍塌到单一 expert
+
+---
+
+### 任务15：MoE v2 — 修复 Router Collapse + 评估
+- **状态：** `执行中` 🔄（2025-03-05）
+- **前置依赖：** 任务14（v1 checkpoint）
+- **阻塞：** 任务8（连通性感知路由损失需要 v2 基线对照）
+
+**问题诊断：**
+MoE SFT v1 (Job 2610726) 训练完成，loss 正常下降（19.25→2.34），但 router 发生 collapse：
+- expert_1 权重 ≈ 0.9999，其余 5 个 expert 权重 ≈ 1e-6
+- routing_entropy ≈ 0.0002（接近 0，理想值 ≈ 1.79）
+- 原因：`balance_weight=0.0`，`z_loss_weight=0.0`，router 无任何约束
+
+**修复方案（三个子任务）：**
+
+**子任务 A：Copy Expert Init ✅ 完成（2025-03-05 00:00）**
+- 从 v1 checkpoint 复制 expert_1 的 LoRA 权重到其余 5 个 expert
+- 重新初始化 router（小随机权重 + 零 bias → 近均匀分布）
+- 保存为 `moe_sft_v1_copy_init/` checkpoint
+- 文件：`train_GUI_360/moe_sft/copy_expert_init.py`
+- 验证结果：
+  - 6 个 expert 权重完全一致 ✅
+  - Router 初始 routing entropy = 1.7813（max 1.7918），normalized = 0.9942 ✅
+  - Source expert 参数量：5,046,272（112 个权重张量）
+
+**子任务 B：v2 重训练 with Balance Loss 🔄 训练中 Job 2624595（2025-03-05 00:00 提交）**
+- 从 copy-init checkpoint 开始训练，4 nodes × 4 GPUs
+- 关键变化（vs v1）：
+  - `balance_weight`: 0.0 → **0.1**（entropy-based balance loss）
+  - `balance_type`: "mse" → **"entropy"**（更适合防 collapse）
+  - `z_loss_weight`: 0.0 → **0.01**（稳定 router logits）
+  - `learning_rate`: 5e-5 → **2e-5**（experts 已 warm）
+  - `warmup_ratio`: 0.05 → **0.1**（更缓的 warmup）
+  - `save_steps`: 500 → **200**（更频繁保存以监控 collapse）
+- 文件：
+  - `train_GUI_360/moe_sft/moe_sft_config_v2.yaml`
+  - `train_GUI_360/moe_sft/train_moe_sft.py`（修改：新增 `--moe_init_checkpoint` 参数 + balance/z-loss 日志）
+  - `train_GUI_360/moe_sft/train_moe_sft_v2.slurm`
+
+**子任务 C：评估 MoE v1 Baseline + SFT checkpoint-398 🔄 评估中（2025-03-05 00:00 提交）**
+- **C1**: 合并 MoE v1 expert_1 LoRA 到 base model（`merge_moe_to_hf.py`）
+  - Router collapse → expert_1 权重≈1.0，直接 merge: `weight += (lora_B @ lora_A) * (alpha/r)`
+  - 输出标准 HF 模型，vLLM 可直接 serve
+- **C2**: 评估 MoE v1 merged model — 🔄 Job 2624593 运行中（`eval_moe_v1.slurm`，port 19807）
+- **C3**: 评估 SFT checkpoint-398 — 🔄 Job 2624594 运行中（`eval_sft_398.slurm`，port 19808）
+- 评估内容：grounding + action_prediction + action_prediction_a11y
+
+**已创建/修改文件：**
+| 文件 | 操作 | 子任务 |
+|------|------|--------|
+| `train_GUI_360/moe_sft/copy_expert_init.py` | 新建 | A |
+| `train_GUI_360/moe_sft/moe_sft_config_v2.yaml` | 新建 | B |
+| `train_GUI_360/moe_sft/train_moe_sft.py` | 修改 | B |
+| `train_GUI_360/moe_sft/train_moe_sft_v2.slurm` | 新建 | B |
+| `train_GUI_360/moe_sft/merge_moe_to_hf.py` | 新建 | C |
+| `train_GUI_360/moe_sft/eval_moe_v1.slurm` | 新建 | C |
+| `train_GUI_360/moe_sft/eval_sft_398.slurm` | 新建 | C |
+
+**执行顺序：**
+```bash
+# 1. Task A: 复制 expert init（本地，几秒完成）
+cd /scratch/a5l/shuqing.a5l/MobileAgent/UI-S1
+python train_GUI_360/moe_sft/copy_expert_init.py
+
+# 2. Task C: 合并 + 评估（可与 Task B 并行）
+sbatch train_GUI_360/moe_sft/eval_moe_v1.slurm   # 自动先 merge 再 eval
+sbatch train_GUI_360/moe_sft/eval_sft_398.slurm
+
+# 3. Task B: v2 重训练（需要 Task A 的 checkpoint）
+sbatch train_GUI_360/moe_sft/train_moe_sft_v2.slurm
+```
+
+**执行日志：**
+```
+2025-03-04 23:59:38  Task A: copy_expert_init.py 开始执行
+2025-03-04 23:59:38  加载 v1 checkpoint: output/moe_sft_v1/final/ (expert_1: 112 tensors, 5,046,272 params)
+2025-03-04 23:59:44  6 个 expert 全部复制完成
+2025-03-04 23:59:44  Router 重新初始化: hidden layer → Xavier(gain=0.1), output → randn(std=0.01), bias → zeros
+2025-03-04 23:59:51  验证通过: 6 expert 权重一致 ✅, routing entropy=1.7813/1.7918 (normalized=0.9942) ✅
+2025-03-04 23:59:51  Task A 完成，checkpoint 保存到 output/moe_sft_v1_copy_init/
+
+2025-03-05 00:00:00  Task C: sbatch eval_moe_v1.slurm → Job 2624593 (1 node, port 19807)
+2025-03-05 00:00:00  Task C: sbatch eval_sft_398.slurm → Job 2624594 (1 node, port 19808)
+2025-03-05 00:00:00  Task B: sbatch train_moe_sft_v2.slurm → Job 2624595 (4 nodes × 4 GPUs)
+2025-03-05 00:00:10  3 个 Job 全部 RUNNING 确认
+```
+
+**监控指标（v2 训练期间）：**
+- `routing/entropy` 应保持 >1.0（v1 collapse 到 0.0002）
+- `loss/balance_loss` 应随训练下降
+- `loss/z_loss` 应保持稳定
+- `routing/expert_{i}_weight` 应分散（非集中在单一 expert）
+
+---
+
 ## 总结
 
 | 阶段 | 任务 | 描述 | 优先级 | 状态 |
@@ -1893,8 +2247,11 @@ Agent B（导航专家）：    → macro_cross_app_switch, macro_deep_settings
 | **第三阶段** | 5, 6 | 快捷操作构建（Tool-Use SFT + RL 两种方法） | 高(5) / 中(6) | 5 数据准备✅ 训练待开始 / 6 待开始 |
 | **第四阶段** | 7, 10, 11 | 层次化策略 + MVP 实验 | 高 | 待开始 |
 | **第五阶段** | 8, 9, 12, 13 | MoE 集成 + 扩展 | 中(8-12) / 低(13) | 待开始 |
+| **第六阶段** | 14 | MoE SFT v1 基线（6×ExpertLoRA, top_k=6） | 高 | ✅ 完成 Job 2610726（router collapse） |
+| **第六阶段** | 15 | MoE v2 修复 Router Collapse + 评估 | 高 | 🔄 执行中：A✅ B=Job2624595 C=Job2624593/2624594 |
 
 **MVP 关键路径：** 任务 1 ✅ → 2 ✅ → 3 ✅ → 4 ✅ → 5 数据✅/训练 → 7 → 10（7个任务，纯数据驱动，无需 RL）
+**MoE SFT 基线路径：** 任务 14 ✅ v1完成(collapse) → 15 🔄 执行中 A✅/B训练中/C评估中
 
 **实现范围：** 仅针对 GUI-360 数据集
 
@@ -1934,6 +2291,20 @@ Agent B（导航专家）：    → macro_cross_app_switch, macro_deep_settings
 | 任务5 | `outputs/macro_sft/macro_tool_definitions.json` | 3 个快捷操作 tool JSON Schema |
 | 任务5 | `outputs/macro_sft/crossing_trajectories/` | Per-app 跨越轨迹列表 |
 | 任务5 | `outputs/macro_sft/statistics.json` | 数据统计 |
+
+| 任务14 | `verl/models/moe/expert_lora.py`（已修改） | 新增 `MoELoRALinear` 模块替换类 |
+| 任务14 | `verl/models/moe/moe_wrapper.py`（已重写） | 模块替换：`_replace_target_modules()` + routing weight 管理 |
+| 任务14 | `verl/models/moe/__init__.py`（已更新） | 导出 `MoELoRALinear` |
+| 任务14 | `train_GUI_360/moe_sft/moe_sft_config.yaml` | MoE SFT v1 训练配置（模型/MoE/数据/超参） |
+| 任务14 | `train_GUI_360/moe_sft/train_moe_sft.py`（已修改x2） | 主训练脚本 + `--moe_init_checkpoint` 参数 |
+| 任务14 | `train_GUI_360/moe_sft/ds_z2_config.json` | DeepSpeed ZeRO-2 配置（当前未使用） |
+| 任务14 | `train_GUI_360/moe_sft/train_moe_sft.slurm` | SLURM 提交脚本（4 nodes × 4 GPUs, 24h） |
+| 任务15 | `train_GUI_360/moe_sft/copy_expert_init.py` | Copy-Init: expert_1 → 全部 expert + router 重置 |
+| 任务15 | `train_GUI_360/moe_sft/moe_sft_config_v2.yaml` | v2 训练配置（balance_weight=0.1, entropy, z_loss=0.01） |
+| 任务15 | `train_GUI_360/moe_sft/train_moe_sft_v2.slurm` | v2 训练 SLURM（指向 v2 config + copy-init checkpoint） |
+| 任务15 | `train_GUI_360/moe_sft/merge_moe_to_hf.py` | 合并 expert_1 LoRA 到 base model（vLLM 推理用） |
+| 任务15 | `train_GUI_360/moe_sft/eval_moe_v1.slurm` | 评估 MoE v1 merged model（port 19807） |
+| 任务15 | `train_GUI_360/moe_sft/eval_sft_398.slurm` | 评估 SFT checkpoint-398（port 19808） |
 
 **核心参考文献：**
 - Jinnai et al. (2020). *Exploration in RL with Deep Covering Options.* ICLR 2020.

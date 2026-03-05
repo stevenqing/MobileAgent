@@ -46,6 +46,7 @@ from verl.models.moe.router import (
 
 from verl.models.moe.expert_lora import (
     LoRALayer,
+    MoELoRALinear,
     SingleExpertLoRA,
     ExpertLoRACollection,
     ExpertLoRAConfig,
@@ -115,6 +116,7 @@ __all__ = [
     "compute_routing_diversity",
     # Expert LoRA
     "LoRALayer",
+    "MoELoRALinear",
     "SingleExpertLoRA",
     "ExpertLoRACollection",
     "ExpertLoRAConfig",

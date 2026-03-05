@@ -16,11 +16,8 @@
 MoE VLM Wrapper for GUI Agent.
 
 This module wraps a base VLM (Qwen2.5-VL) with MoE routing and expert LoRAs.
-It integrates:
-1. Frozen base VLM for encoding
-2. Text-only router for expert selection
-3. Expert LoRA collection for specialization
-4. MoE loss computation
+It uses **module replacement** (not hooks) to inject expert LoRA deltas into
+the base model's Linear layers, ensuring correct gradient flow during training.
 
 Architecture:
     Input: (screenshot, instruction)
@@ -28,30 +25,23 @@ Architecture:
               ▼
     ┌─────────────────────────────────────────┐
     │         Base VLM (Frozen)                │
-    │   [Vision Encoder + Text Encoder]        │
-    │              │                           │
-    │              ▼                           │
-    │       hidden_states                      │
+    │   target Linear layers replaced with     │
+    │   MoELoRALinear (frozen base + LoRA)     │
     └─────────────────────────────────────────┘
-              │                    │
-              ▼                    ▼
-    ┌─────────────────┐    ┌─────────────────┐
-    │     Router      │    │  Expert LoRAs   │
-    │ (instruction    │───▶│ (weighted by    │
-    │  features)      │    │  routing)       │
-    └─────────────────┘    └─────────────────┘
-                                   │
-                                   ▼
-                            ┌─────────────┐
-                            │   LM Head   │
-                            └─────────────┘
-                                   │
-                                   ▼
-                             Action Output
+              │
+    Pass 1: LoRA disabled (routing_weights=None)
+              │ → hidden_states → Router → routing_weights
+              │
+    Pass 2: LoRA enabled (routing_weights set on MoELoRALinear modules)
+              │ → logits + loss
+              ▼
+         Action Output
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -68,11 +58,12 @@ from verl.models.moe.router import (
     create_instruction_mask,
 )
 from verl.models.moe.expert_lora import (
-    ExpertLoRACollection,
-    ExpertLoRAConfig,
-    MoEExpertApplier,
+    MoELoRALinear,
+    LoRALayer,
 )
 from verl.models.moe.moe_loss import MoELoss, MoELossOutput
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -170,14 +161,15 @@ class MoEOutput:
 
 class MoEVLMWrapper(nn.Module):
     """
-    MoE Wrapper for Vision-Language Model.
+    MoE Wrapper for Vision-Language Model using module replacement.
 
     Wraps a base VLM (frozen) with:
     - Text-only router for expert selection
-    - Expert LoRA collection for parameter-efficient specialization
-    - Hook-based LoRA injection
+    - MoELoRALinear modules replacing target nn.Linear layers
 
-    The base model remains frozen. Only router and expert LoRAs are trained.
+    Unlike hook-based approaches, module replacement ensures correct gradient
+    flow to expert LoRA parameters during training. DDP works naturally since
+    LoRA params are proper children in the module tree.
 
     Args:
         base_model: Pre-trained VLM (will be frozen)
@@ -187,7 +179,7 @@ class MoEVLMWrapper(nn.Module):
     Example:
         >>> from transformers import Qwen2VLForConditionalGeneration
         >>> base = Qwen2VLForConditionalGeneration.from_pretrained("Qwen/Qwen2.5-VL-7B")
-        >>> config = MoEConfig(num_experts=4, expert_lora_r=16)
+        >>> config = MoEConfig(num_experts=6, expert_lora_r=16)
         >>> moe_model = MoEVLMWrapper(base, config)
         >>> outputs = moe_model(input_ids, attention_mask, pixel_values, labels=labels)
     """
@@ -213,11 +205,8 @@ class MoEVLMWrapper(nn.Module):
         # Freeze base model
         self._freeze_base_model()
 
-        # Initialize MoE components
+        # Initialize MoE components (router, loss, module replacement)
         self._init_moe_components()
-
-        # Track if hooks are registered
-        self._hooks_registered = False
 
     def _get_hidden_size(self) -> int:
         """Get hidden size from base model."""
@@ -241,13 +230,10 @@ class MoEVLMWrapper(nn.Module):
         """Freeze all base model parameters."""
         for param in self.base_model.parameters():
             param.requires_grad = False
-
-        # Ensure base model is in eval mode for consistent behavior
-        # (but we'll still call train() on MoE components)
         self.base_model.eval()
 
     def _init_moe_components(self):
-        """Initialize router, expert LoRAs, and applier."""
+        """Initialize router, MoE loss, and replace target modules with MoELoRALinear."""
         config = self.moe_config
 
         # 1. Router
@@ -260,29 +246,12 @@ class MoEVLMWrapper(nn.Module):
             temperature=config.router_temperature,
         )
 
-        # 2. Expert LoRA Collection
-        self.expert_collection = ExpertLoRACollection(
-            num_layers=self.num_layers,
-            hidden_size=self.hidden_size,
-            num_experts=config.num_experts,
-            target_modules=config.target_modules,
-            lora_r=config.expert_lora_r,
-            lora_alpha=config.expert_lora_alpha,
-            lora_dropout=config.expert_lora_dropout,
-        )
-
-        # 3. Feature Extractor
+        # 2. Feature Extractor
         self.feature_extractor = InstructionFeatureExtractor(
             pooling_strategy=config.pooling_strategy,
         )
 
-        # 4. Expert Applier (manages hooks)
-        self.expert_applier = MoEExpertApplier(
-            expert_collection=self.expert_collection,
-            use_vectorized=config.use_vectorized_routing,
-        )
-
-        # 5. MoE Loss
+        # 3. MoE Loss
         self.moe_loss = MoELoss(
             num_experts=config.num_experts,
             balance_weight=config.balance_weight,
@@ -290,18 +259,84 @@ class MoEVLMWrapper(nn.Module):
             z_loss_weight=config.z_loss_weight,
         )
 
-    def register_hooks(self):
-        """Register forward hooks with base model layers."""
-        if self._hooks_registered:
-            return
+        # 4. Replace target modules with MoELoRALinear
+        self._moe_linear_modules: List[MoELoRALinear] = []
+        self._replace_target_modules()
 
-        self.expert_applier.register_hooks(self.base_model)
-        self._hooks_registered = True
+    def _find_layers(self) -> nn.ModuleList:
+        """Find the transformer layers in the base model."""
+        # Try common patterns
+        for pattern in ["model.layers", "model.model.layers", "language_model.model.layers"]:
+            parts = pattern.split(".")
+            obj = self.base_model
+            found = True
+            for part in parts:
+                if hasattr(obj, part):
+                    obj = getattr(obj, part)
+                else:
+                    found = False
+                    break
+            if found and isinstance(obj, nn.ModuleList):
+                return obj
 
-    def remove_hooks(self):
-        """Remove all registered hooks."""
-        self.expert_applier.remove_hooks()
-        self._hooks_registered = False
+        # Fallback: find any ModuleList named "layers"
+        for name, module in self.base_model.named_modules():
+            if name.endswith('layers') and isinstance(module, nn.ModuleList):
+                return module
+
+        raise ValueError("Could not find transformer layers in base model")
+
+    def _replace_target_modules(self):
+        """Replace target nn.Linear modules with MoELoRALinear."""
+        config = self.moe_config
+        layers = self._find_layers()
+        replaced = 0
+
+        for layer_idx, layer in enumerate(layers):
+            for module_name in config.target_modules:
+                # Find parent module and target
+                if module_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                    parent = getattr(layer, 'self_attn', None)
+                elif module_name in ['gate_proj', 'up_proj', 'down_proj']:
+                    parent = getattr(layer, 'mlp', None)
+                else:
+                    parent = layer
+
+                if parent is None:
+                    continue
+
+                original_linear = getattr(parent, module_name, None)
+                if original_linear is None or not isinstance(original_linear, nn.Linear):
+                    continue
+
+                # Create MoELoRALinear replacement
+                moe_linear = MoELoRALinear(
+                    base_linear=original_linear,
+                    num_experts=config.num_experts,
+                    r=config.expert_lora_r,
+                    alpha=config.expert_lora_alpha,
+                    dropout=config.expert_lora_dropout,
+                )
+
+                # Replace in parent module
+                setattr(parent, module_name, moe_linear)
+                self._moe_linear_modules.append(moe_linear)
+                replaced += 1
+
+        logger.info(
+            f"Replaced {replaced} Linear modules with MoELoRALinear "
+            f"({config.num_experts} experts, r={config.expert_lora_r})"
+        )
+
+    def _set_routing_weights(self, routing_weights: torch.Tensor):
+        """Set routing weights on all MoELoRALinear modules."""
+        for m in self._moe_linear_modules:
+            m.set_routing_weights(routing_weights)
+
+    def _clear_routing_weights(self):
+        """Clear routing weights (MoELoRALinear acts as plain Linear)."""
+        for m in self._moe_linear_modules:
+            m.set_routing_weights(None)
 
     def forward(
         self,
@@ -318,17 +353,13 @@ class MoEVLMWrapper(nn.Module):
         """
         Forward pass with MoE routing.
 
-        Steps:
-        1. Get hidden states from base model (frozen)
-        2. Extract instruction features
-        3. Compute routing weights
-        4. Apply expert LoRAs via hooks
-        5. Compute loss if labels provided
+        Pass 1 (no_grad, LoRA disabled): Extract hidden states for routing.
+        Pass 2 (with grad, LoRA enabled): Compute logits and loss with expert deltas.
 
         Args:
             input_ids: [B, seq_len] Input token IDs
             attention_mask: [B, seq_len] Attention mask
-            pixel_values: Vision inputs (format depends on model)
+            pixel_values: Vision inputs
             labels: [B, seq_len] Labels for LM loss
             instruction_mask: [B, seq_len] Boolean mask for instruction tokens
             instruction_texts: List of instruction strings (alternative to mask)
@@ -338,14 +369,8 @@ class MoEVLMWrapper(nn.Module):
         Returns:
             MoEOutput with logits, loss, and routing information
         """
-        batch_size = input_ids.size(0)
-        device = input_ids.device
-
-        # Ensure hooks are registered
-        if not self._hooks_registered:
-            self.register_hooks()
-
-        # Step 1: Get hidden states from base model (first pass, no LoRA)
+        # ---- Pass 1: Get hidden states for routing (no LoRA, no grad) ----
+        self._clear_routing_weights()
         with torch.no_grad():
             base_outputs = self.base_model(
                 input_ids=input_ids,
@@ -359,13 +384,12 @@ class MoEVLMWrapper(nn.Module):
         # Get last hidden state
         if hasattr(base_outputs, 'hidden_states') and base_outputs.hidden_states:
             hidden_states = base_outputs.hidden_states[-1]
+        elif hasattr(base_outputs, 'last_hidden_state'):
+            hidden_states = base_outputs.last_hidden_state
         else:
-            # Fallback if hidden_states not available
-            hidden_states = base_outputs.last_hidden_state if hasattr(base_outputs, 'last_hidden_state') else None
-            if hidden_states is None:
-                raise ValueError("Cannot get hidden states from base model")
+            raise ValueError("Cannot get hidden states from base model")
 
-        # Step 2: Create instruction mask if not provided
+        # ---- Create instruction mask if not provided ----
         if instruction_mask is None:
             if instruction_texts is not None and self.tokenizer is not None:
                 from verl.models.moe.router import create_instruction_mask_from_text
@@ -375,24 +399,14 @@ class MoEVLMWrapper(nn.Module):
             elif self.tokenizer is not None:
                 instruction_mask = create_instruction_mask(input_ids, self.tokenizer)
             else:
-                # Fallback: use all tokens
                 instruction_mask = torch.ones_like(input_ids, dtype=torch.bool)
 
-        # Step 3: Extract instruction features
+        # ---- Compute routing ----
         instruction_features = self.feature_extractor(hidden_states, instruction_mask)
-
-        # Step 4: Compute routing
         router_output = self.router(instruction_features)
 
-        # Step 5: Set routing for expert applier
-        self.expert_applier.set_routing(
-            top_k_indices=router_output.top_k_indices,
-            top_k_weights=router_output.top_k_weights,
-            routing_weights=router_output.routing_weights if self.moe_config.use_vectorized_routing else None,
-        )
-
-        # Step 6: Forward with expert LoRAs (second pass)
-        # This time, the hooks will apply LoRA deltas
+        # ---- Pass 2: Forward with expert LoRAs enabled ----
+        self._set_routing_weights(router_output.routing_weights)
         outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -403,10 +417,7 @@ class MoEVLMWrapper(nn.Module):
             **kwargs,
         )
 
-        # Step 7: Clear routing state
-        self.expert_applier.clear_routing()
-
-        # Step 8: Compute MoE loss if labels provided
+        # ---- Compute loss ----
         loss = None
         lm_loss = None
         balance_loss = None
@@ -423,7 +434,7 @@ class MoEVLMWrapper(nn.Module):
             balance_loss = loss_output.balance_loss
             z_loss = loss_output.z_loss
 
-        # Build output
+        # ---- Build output ----
         moe_output = MoEOutput(
             logits=outputs.logits,
             loss=loss,
@@ -457,13 +468,11 @@ class MoEVLMWrapper(nn.Module):
         """
         Generate with MoE routing.
 
-        Routes to experts first, then generates using selected experts.
-
         Args:
             input_ids: [B, seq_len] Input token IDs
             attention_mask: [B, seq_len] Attention mask
             pixel_values: Vision inputs
-            image_grid_thw: Image grid (temporal, height, width) for Qwen2.5-VL
+            image_grid_thw: Image grid for Qwen2.5-VL
             instruction_mask: [B, seq_len] Instruction token mask
             instruction_texts: Alternative to instruction_mask
             max_new_tokens: Maximum tokens to generate
@@ -473,13 +482,8 @@ class MoEVLMWrapper(nn.Module):
             generated_ids: [B, seq_len + generated_len]
             router_output: Routing information
         """
-        batch_size = input_ids.size(0)
-
-        # Ensure hooks are registered
-        if not self._hooks_registered:
-            self.register_hooks()
-
-        # Get hidden states for routing
+        # Pass 1: Get hidden states for routing (no LoRA)
+        self._clear_routing_weights()
         with torch.no_grad():
             base_outputs = self.base_model(
                 input_ids=input_ids,
@@ -504,18 +508,14 @@ class MoEVLMWrapper(nn.Module):
             else:
                 instruction_mask = torch.ones_like(input_ids, dtype=torch.bool)
 
-        # Extract features and compute routing
+        # Compute routing
         instruction_features = self.feature_extractor(hidden_states, instruction_mask)
         router_output = self.router(instruction_features)
 
-        # Set routing for generation
-        self.expert_applier.set_routing(
-            top_k_indices=router_output.top_k_indices,
-            top_k_weights=router_output.top_k_weights,
-            routing_weights=router_output.routing_weights if self.moe_config.use_vectorized_routing else None,
-        )
+        # Set routing for generation (LoRA enabled)
+        self._set_routing_weights(router_output.routing_weights)
 
-        # Generate with expert LoRAs
+        # Generate
         generated_ids = self.base_model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -525,16 +525,18 @@ class MoEVLMWrapper(nn.Module):
             **generate_kwargs,
         )
 
-        # Clear routing
-        self.expert_applier.clear_routing()
+        # Clear routing after generation
+        self._clear_routing_weights()
 
         return generated_ids, router_output
 
     def get_trainable_parameters(self) -> List[nn.Parameter]:
-        """Get list of trainable parameters (router + expert LoRAs)."""
+        """Get list of trainable parameters (router + expert LoRAs in MoELoRALinear)."""
         params = []
         params.extend(list(self.router.parameters()))
-        params.extend(list(self.expert_collection.parameters()))
+        for m in self._moe_linear_modules:
+            for lora in m.expert_loras:
+                params.extend(list(lora.parameters()))
         return params
 
     def num_trainable_parameters(self) -> int:
@@ -546,15 +548,13 @@ class MoEVLMWrapper(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def train(self, mode: bool = True):
-        """Set training mode (only affects MoE components, base model stays frozen)."""
-        # Base model always in eval
+        """Set training mode (only affects MoE components, base stays frozen)."""
         self.base_model.eval()
-
-        # MoE components follow mode
         self.router.train(mode)
-        self.expert_collection.train(mode)
         self.feature_extractor.train(mode)
-
+        for m in self._moe_linear_modules:
+            for lora in m.expert_loras:
+                lora.train(mode)
         return self
 
     def eval(self):
@@ -563,18 +563,16 @@ class MoEVLMWrapper(nn.Module):
 
     def save_moe_checkpoint(self, save_dir: str):
         """
-        Save MoE components (router + experts).
+        Save MoE components (router + expert LoRAs) in PEFT-compatible format.
 
         Creates:
         - router.pt: Router state dict
-        - experts/: Directory with PEFT-format experts
+        - experts/expert_{i}/adapter_model.bin: Per-expert PEFT weights
         - moe_config.json: Configuration
 
         Args:
             save_dir: Directory to save checkpoint
         """
-        import json
-
         os.makedirs(save_dir, exist_ok=True)
 
         # Save router
@@ -583,16 +581,58 @@ class MoEVLMWrapper(nn.Module):
             os.path.join(save_dir, 'router.pt')
         )
 
-        # Save experts in PEFT format
+        # Save experts in PEFT format (per expert)
+        config = self.moe_config
         experts_dir = os.path.join(save_dir, 'experts')
-        self.expert_collection.save_experts_separately(experts_dir, save_format='peft')
+        os.makedirs(experts_dir, exist_ok=True)
 
-        # Save config
-        config_path = os.path.join(save_dir, 'moe_config.json')
-        with open(config_path, 'w') as f:
-            json.dump(self.moe_config.to_dict(), f, indent=2)
+        # Collect expert LoRA weights organized by expert
+        layers = self._find_layers()
+        for expert_idx in range(config.num_experts):
+            peft_state_dict = {}
+            module_idx = 0
 
-        print(f"Saved MoE checkpoint to {save_dir}")
+            for layer_idx in range(len(layers)):
+                for module_name in config.target_modules:
+                    if module_idx >= len(self._moe_linear_modules):
+                        break
+                    moe_linear = self._moe_linear_modules[module_idx]
+                    lora_layer = moe_linear.expert_loras[expert_idx]
+
+                    # Build PEFT key
+                    if module_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                        prefix = f"base_model.model.model.layers.{layer_idx}.self_attn.{module_name}"
+                    elif module_name in ['gate_proj', 'up_proj', 'down_proj']:
+                        prefix = f"base_model.model.model.layers.{layer_idx}.mlp.{module_name}"
+                    else:
+                        prefix = f"base_model.model.model.layers.{layer_idx}.{module_name}"
+
+                    peft_state_dict[f"{prefix}.lora_A.weight"] = lora_layer.lora_A.data.clone()
+                    peft_state_dict[f"{prefix}.lora_B.weight"] = lora_layer.lora_B.data.clone()
+                    module_idx += 1
+
+            expert_dir = os.path.join(experts_dir, f'expert_{expert_idx}')
+            os.makedirs(expert_dir, exist_ok=True)
+            torch.save(peft_state_dict, os.path.join(expert_dir, 'adapter_model.bin'))
+
+            # Save PEFT config
+            peft_config = {
+                "peft_type": "LORA",
+                "task_type": "CAUSAL_LM",
+                "r": config.expert_lora_r,
+                "lora_alpha": config.expert_lora_alpha,
+                "target_modules": config.target_modules,
+                "lora_dropout": config.expert_lora_dropout,
+                "bias": "none",
+            }
+            with open(os.path.join(expert_dir, 'adapter_config.json'), 'w') as f:
+                json.dump(peft_config, f, indent=2)
+
+        # Save MoE config
+        with open(os.path.join(save_dir, 'moe_config.json'), 'w') as f:
+            json.dump(config.to_dict(), f, indent=2)
+
+        logger.info(f"Saved MoE checkpoint to {save_dir}")
 
     def load_moe_checkpoint(self, load_dir: str):
         """
@@ -606,13 +646,48 @@ class MoEVLMWrapper(nn.Module):
         if os.path.exists(router_path):
             state_dict = torch.load(router_path, map_location='cpu')
             self.router.load_state_dict(state_dict)
-            print(f"Loaded router from {router_path}")
+            logger.info(f"Loaded router from {router_path}")
 
         # Load experts
+        config = self.moe_config
         experts_dir = os.path.join(load_dir, 'experts')
-        if os.path.exists(experts_dir):
-            self.expert_collection.load_experts_separately(experts_dir, load_format='peft')
-            print(f"Loaded experts from {experts_dir}")
+        if not os.path.exists(experts_dir):
+            return
+
+        layers = self._find_layers()
+        for expert_idx in range(config.num_experts):
+            expert_dir = os.path.join(experts_dir, f'expert_{expert_idx}')
+            adapter_path = os.path.join(expert_dir, 'adapter_model.bin')
+            if not os.path.exists(adapter_path):
+                logger.warning(f"Expert {expert_idx} not found at {expert_dir}")
+                continue
+
+            peft_state_dict = torch.load(adapter_path, map_location='cpu')
+
+            module_idx = 0
+            for layer_idx in range(len(layers)):
+                for module_name in config.target_modules:
+                    if module_idx >= len(self._moe_linear_modules):
+                        break
+                    moe_linear = self._moe_linear_modules[module_idx]
+                    lora_layer = moe_linear.expert_loras[expert_idx]
+
+                    if module_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                        prefix = f"base_model.model.model.layers.{layer_idx}.self_attn.{module_name}"
+                    elif module_name in ['gate_proj', 'up_proj', 'down_proj']:
+                        prefix = f"base_model.model.model.layers.{layer_idx}.mlp.{module_name}"
+                    else:
+                        prefix = f"base_model.model.model.layers.{layer_idx}.{module_name}"
+
+                    a_key = f"{prefix}.lora_A.weight"
+                    b_key = f"{prefix}.lora_B.weight"
+                    if a_key in peft_state_dict:
+                        lora_layer.lora_A.data.copy_(peft_state_dict[a_key])
+                    if b_key in peft_state_dict:
+                        lora_layer.lora_B.data.copy_(peft_state_dict[b_key])
+                    module_idx += 1
+
+        logger.info(f"Loaded experts from {experts_dir}")
 
     def get_routing_statistics(
         self,
@@ -632,21 +707,16 @@ class MoEVLMWrapper(nn.Module):
 
         stats = {}
 
-        # Expert utilization
         utilization = compute_expert_utilization(
             routing_weights, self.moe_config.num_experts
         )
         for i, u in enumerate(utilization.tolist()):
             stats[f'expert_{i}_utilization'] = u
 
-        # Load balance coefficient
         stats['load_balance_coefficient'] = compute_load_balance_coefficient(utilization)
 
-        # Routing entropy
         entropy = compute_routing_entropy(routing_weights)
         stats['routing_entropy_mean'] = entropy.mean().item()
-
-        # Routing diversity
         stats['routing_diversity'] = compute_routing_diversity(routing_weights)
 
         return stats
@@ -672,7 +742,6 @@ def create_moe_wrapper(
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    # Load base model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -682,11 +751,9 @@ def create_moe_wrapper(
         **model_kwargs,
     )
 
-    # Create config
     if moe_config is None:
         moe_config = MoEConfig()
 
-    # Create wrapper
     wrapper = MoEVLMWrapper(
         base_model=model,
         moe_config=moe_config,
@@ -697,7 +764,7 @@ def create_moe_wrapper(
 
 
 if __name__ == "__main__":
-    print("Testing MoE VLM Wrapper (mock base model)...")
+    print("Testing MoE VLM Wrapper (module replacement)...")
     print()
 
     # Create a simple mock base model for testing
@@ -731,9 +798,15 @@ if __name__ == "__main__":
         def forward(self, input_ids, attention_mask=None, pixel_values=None,
                     labels=None, output_hidden_states=False, return_dict=True, **kwargs):
             batch_size, seq_len = input_ids.shape
-            # Mock hidden states
             hidden = torch.randn(batch_size, seq_len, 256)
-            hidden_states = tuple([hidden] * 5)  # 4 layers + embedding
+
+            # Pass through layers (so MoELoRALinear modules get called)
+            for layer in self.layers:
+                q_out = layer['self_attn']['q_proj'](hidden)
+                v_out = layer['self_attn']['v_proj'](hidden)
+                hidden = hidden + q_out + v_out  # simplified
+
+            hidden_states = tuple([hidden] * 5)
             logits = self.lm_head(hidden)
 
             loss = None
@@ -747,7 +820,6 @@ if __name__ == "__main__":
             return MockOutput(hidden_states, logits, loss)
 
         def generate(self, input_ids, **kwargs):
-            # Mock generation
             batch_size = input_ids.size(0)
             new_tokens = torch.randint(0, 1000, (batch_size, 10))
             return torch.cat([input_ids, new_tokens], dim=1)
@@ -758,21 +830,28 @@ if __name__ == "__main__":
     # Create MoE config
     config = MoEConfig(
         num_experts=4,
-        top_k=1,
+        top_k=4,  # all experts
         expert_lora_r=8,
         expert_lora_alpha=16,
         target_modules=['q_proj', 'v_proj'],
-        balance_weight=0.1,
+        balance_weight=0.0,
+        use_vectorized_routing=True,
     )
 
-    # Create wrapper
-    print("Test 1: Creating MoE wrapper...")
+    # Test 1: Creation
+    print("Test 1: Creating MoE wrapper with module replacement...")
     wrapper = MoEVLMWrapper(base_model, config)
+    print(f"  MoELoRALinear modules: {len(wrapper._moe_linear_modules)}")
     print(f"  Trainable params: {wrapper.num_trainable_parameters():,}")
     print(f"  Total params: {wrapper.num_total_parameters():,}")
+
+    # Verify module replacement happened
+    assert isinstance(base_model.layers[0]['self_attn']['q_proj'], MoELoRALinear)
+    assert isinstance(base_model.layers[0]['self_attn']['v_proj'], MoELoRALinear)
+    print("  Module replacement verified ✓")
     print("  PASSED")
 
-    # Test forward pass
+    # Test 2: Forward pass
     print("\nTest 2: Forward pass...")
     batch_size = 4
     seq_len = 32
@@ -781,7 +860,7 @@ if __name__ == "__main__":
     attention_mask = torch.ones_like(input_ids)
     labels = torch.randint(0, 1000, (batch_size, seq_len))
     instruction_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-    instruction_mask[:, 5:15] = True  # Instructions at positions 5-15
+    instruction_mask[:, 5:15] = True
 
     output = wrapper(
         input_ids=input_ids,
@@ -792,16 +871,14 @@ if __name__ == "__main__":
 
     print(f"  Logits shape: {output.logits.shape}")
     print(f"  Loss: {output.loss.item():.4f}")
-    print(f"  LM Loss: {output.lm_loss.item():.4f}")
-    print(f"  Balance Loss: {output.balance_loss.item():.6f}")
     print(f"  Routing weights shape: {output.routing_weights.shape}")
-    print(f"  Top-k indices: {output.top_k_indices.squeeze().tolist()}")
     print("  PASSED")
 
-    # Test gradient flow
-    print("\nTest 3: Gradient flow...")
+    # Test 3: Gradient flow
+    print("\nTest 3: Gradient flow (the critical test)...")
     wrapper.train()
     optimizer = torch.optim.Adam(wrapper.get_trainable_parameters(), lr=1e-4)
+    optimizer.zero_grad()
 
     output = wrapper(
         input_ids=input_ids,
@@ -811,39 +888,55 @@ if __name__ == "__main__":
     )
 
     output.loss.backward()
+
+    # Check router gradients
+    router_grads = sum(
+        1 for p in wrapper.router.parameters()
+        if p.grad is not None and p.grad.abs().sum() > 0
+    )
+    print(f"  Router params with grad: {router_grads}")
+
+    # Check LoRA gradients
+    lora_grads = 0
+    lora_total = 0
+    for m in wrapper._moe_linear_modules:
+        for lora in m.expert_loras:
+            for p in lora.parameters():
+                lora_total += 1
+                if p.grad is not None and p.grad.abs().sum() > 0:
+                    lora_grads += 1
+    print(f"  LoRA params with grad: {lora_grads}/{lora_total}")
+
+    assert lora_grads > 0, "FAILED: No LoRA gradients! Module replacement didn't fix gradient flow."
+    assert router_grads > 0, "FAILED: No router gradients!"
+    print("  PASSED — Gradients flow correctly ✓")
+
     optimizer.step()
 
-    # Check gradients exist
-    has_grads = any(p.grad is not None and p.grad.abs().sum() > 0
-                    for p in wrapper.get_trainable_parameters())
-    assert has_grads, "No gradients computed"
-    print("  PASSED")
-
-    # Test routing statistics
-    print("\nTest 4: Routing statistics...")
-    stats = wrapper.get_routing_statistics(output.routing_weights)
-    for k, v in stats.items():
-        print(f"  {k}: {v:.4f}")
-    print("  PASSED")
-
-    # Test save/load
-    print("\nTest 5: Save/Load checkpoint...")
+    # Test 4: Save/Load
+    print("\nTest 4: Save/Load checkpoint...")
     import tempfile
     with tempfile.TemporaryDirectory() as tmpdir:
         wrapper.save_moe_checkpoint(tmpdir)
 
+        # Verify files exist
+        assert os.path.exists(os.path.join(tmpdir, 'router.pt'))
+        assert os.path.exists(os.path.join(tmpdir, 'experts', 'expert_0', 'adapter_model.bin'))
+        assert os.path.exists(os.path.join(tmpdir, 'moe_config.json'))
+
         # Create new wrapper and load
-        wrapper2 = MoEVLMWrapper(MockBaseModel(), config)
+        base_model2 = MockBaseModel()
+        wrapper2 = MoEVLMWrapper(base_model2, config)
         wrapper2.load_moe_checkpoint(tmpdir)
 
-        # Check weights match
+        # Verify router weights match
         for (n1, p1), (n2, p2) in zip(
             wrapper.router.named_parameters(),
             wrapper2.router.named_parameters()
         ):
-            assert torch.allclose(p1, p2), f"Mismatch in {n1}"
+            assert torch.allclose(p1, p2), f"Router mismatch in {n1}"
 
     print("  PASSED")
 
     print()
-    print("=== All tests passed! ===")
+    print("=== All tests passed! Module replacement works correctly. ===")

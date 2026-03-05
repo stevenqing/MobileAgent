@@ -18,6 +18,7 @@ train_GUI_360/data/
 train_GUI_360/llamafactory/data/
 train_GUI_360/llamafactory/output/
 train_GUI_360/GUI-360-eval/results/
+train_GUI_360/moe_sft/output/
 evaluation/results/
 
 # Build artifacts

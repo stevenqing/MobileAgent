@@ -708,6 +708,109 @@ class ExpertLoRACollection(nn.Module):
         return self.experts[0].num_parameters()
 
 
+class MoELoRALinear(nn.Module):
+    """
+    Module replacement for nn.Linear with MoE expert LoRAs.
+
+    Replaces a frozen nn.Linear with: base_output + weighted_sum(expert_deltas).
+    This is the correct approach for training MoE-LoRA — unlike forward hooks,
+    module replacement ensures gradients flow naturally through expert LoRA params.
+
+    Routing weights are set externally before the forward pass via set_routing_weights().
+    When routing_weights is None, behaves as plain nn.Linear (used for the first pass
+    to extract features for routing).
+
+    Args:
+        base_linear: Original frozen nn.Linear module
+        num_experts: Number of expert LoRAs
+        r: LoRA rank
+        alpha: LoRA scaling factor
+        dropout: LoRA dropout probability
+
+    Example:
+        >>> original = nn.Linear(3584, 3584)
+        >>> moe_linear = MoELoRALinear(original, num_experts=6, r=16)
+        >>> moe_linear.set_routing_weights(torch.softmax(torch.randn(2, 6), dim=-1))
+        >>> out = moe_linear(torch.randn(2, 128, 3584))  # [2, 128, 3584]
+    """
+
+    def __init__(
+        self,
+        base_linear: nn.Linear,
+        num_experts: int,
+        r: int = 16,
+        alpha: int = 32,
+        dropout: float = 0.05,
+    ):
+        super().__init__()
+
+        self.base_linear = base_linear
+        # Freeze base linear
+        self.base_linear.weight.requires_grad_(False)
+        if self.base_linear.bias is not None:
+            self.base_linear.bias.requires_grad_(False)
+
+        in_features = base_linear.in_features
+        out_features = base_linear.out_features
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_experts = num_experts
+
+        # Expert LoRA layers (trainable)
+        self.expert_loras = nn.ModuleList([
+            LoRALayer(in_features, out_features, r, alpha, dropout)
+            for _ in range(num_experts)
+        ])
+
+        # Routing weights: set externally, None means no LoRA applied
+        self._routing_weights: Optional[torch.Tensor] = None
+
+    def set_routing_weights(self, weights: Optional[torch.Tensor]):
+        """Set routing weights for expert combination.
+
+        Args:
+            weights: [B, num_experts] softmax-normalized routing weights, or None to disable LoRA.
+        """
+        self._routing_weights = weights
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass: base_output + weighted expert LoRA deltas.
+
+        Args:
+            x: Input tensor [B, seq_len, in_features]
+
+        Returns:
+            Output tensor [B, seq_len, out_features]
+        """
+        base_out = self.base_linear(x)
+
+        if self._routing_weights is None:
+            return base_out
+
+        # Compute all expert deltas: list of [B, seq_len, out_features]
+        # Stack to [num_experts, B, seq_len, out_features]
+        all_deltas = torch.stack([lora(x) for lora in self.expert_loras], dim=0)
+
+        # Permute to [B, num_experts, seq_len, out_features]
+        all_deltas = all_deltas.permute(1, 0, 2, 3)
+
+        # routing_weights: [B, num_experts] → [B, num_experts, 1, 1]
+        weights = self._routing_weights.unsqueeze(-1).unsqueeze(-1)
+
+        # Weighted sum: [B, seq_len, out_features]
+        weighted_delta = (all_deltas * weights).sum(dim=1)
+
+        return base_out + weighted_delta
+
+    def extra_repr(self) -> str:
+        return (
+            f"in={self.in_features}, out={self.out_features}, "
+            f"experts={self.num_experts}, "
+            f"r={self.expert_loras[0].r}, alpha={self.expert_loras[0].alpha}"
+        )
+
+
 class MoEExpertApplier(nn.Module):
     """
     Applies MoE expert LoRAs during model forward pass.

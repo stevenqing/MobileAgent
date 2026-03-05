@@ -19,12 +19,12 @@ dataset_dir: train_GUI_360/llamafactory/data
 template: qwen2_vl
 cutoff_len: 8192
 preprocessing_num_workers: 4
-dataloader_num_workers: 0
+dataloader_num_workers: 64
 
 ### output
 output_dir: train_GUI_360/llamafactory/output/gui360_full_sft_v2
 logging_steps: 10
-save_steps: 100
+save_steps: 50
 save_total_limit: 5
 plot_loss: true
 overwrite_output_dir: true
@@ -42,7 +42,7 @@ warmup_ratio: 0.05
 weight_decay: 0.1
 bf16: true
 ddp_timeout: 180000000
-resume_from_checkpoint: null
+resume_from_checkpoint: train_GUI_360/llamafactory/output/gui360_full_sft_v2/checkpoint-300
 
 ### eval
 eval_dataset: gui360_val
